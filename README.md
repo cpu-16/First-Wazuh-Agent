@@ -317,17 +317,19 @@ curl -sk -u "admin:TU_PASSWORD_ADMIN" \
 
 ---
 
-## 🤖 7) Integración con n8n
+## 🤖 7) Integración con n8n (actualizado)
 
 **Recomendación práctica:**
 
-- 1 nodo HTTP para Indexer (9200) (Basic Auth)
-- 1 nodo HTTP para API 55000 (JWT + Bearer)
+- **2 nodos HTTP para Indexer (9200)**
+  - 1 para alertas/búsquedas y agregaciones
+  - 1 para vulnerabilidades (Vuln summary by agent)
+- **1 Tool node (Code)** para la API de agentes (JWT + Bearer), a través del proxy con certificado válido
 
 **No conviene mezclar todo en un solo nodo porque:**
-- cambian endpoints
-- cambia el tipo de auth
-- cambia la semántica (alertas vs agentes)
+- cambian endpoints (9200 vs 55001)
+- cambia el tipo de auth (Basic vs JWT/Bearer)
+- cambia la semántica (alertas/vulns vs agentes)
 
 ### 7.1 Nodo HTTP (Indexer 9200) — Body ejemplo (últimas 2h)
 
@@ -351,86 +353,256 @@ curl -sk -u "admin:TU_PASSWORD_ADMIN" \
 
 ![Nodo HTTP Indexer en n8n](docs/images/n8n-indexer.png)
 
-### 7.2 Nodo HTTP (API 55000) — flujo JWT
+### 7.2 Nodo HTTP (Indexer 9200) — Vuln summary by agent
 
-#### Nodo A: Authenticate (token)
+**Configuración (ejemplo genérico para "resumen por agente"):**
 
 - **Method:** POST
-- **URL:** `https://100.109.242.43:55000/security/user/authenticate?raw=true`
-- **Auth:** Basic Auth (`wazuh` + pass)
-- **Respuesta:** texto (JWT raw)
+- **URL:** `https://100.109.242.43:9200/wazuh-states-vulnerabilities-*/_search`
+- **Auth:** Basic (`admin` + pass)
+- **Header:** `Content-Type: application/json`
 
-#### Nodo B: List agents (Bearer)
+**Body (agregación por agente + severidad):**
 
-- **Method:** GET
-- **URL:** `https://100.109.242.43:55000/agents?limit=200&select=id,name,status,lastKeepAlive,version,ip`
-- **Header:**
-
+```json
+{
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        { "range": { "@timestamp": { "gte": "now-24h", "lt": "now" } } }
+      ]
+    }
+  },
+  "aggs": {
+    "by_agent": {
+      "terms": { "field": "agent.name", "size": 200 },
+      "aggs": {
+        "by_severity": {
+          "terms": { "field": "vulnerability.severity", "size": 10 }
+        }
+      }
+    }
+  }
+}
 ```
-Authorization: Bearer {{$json}}
+
+> ⚠️ **Nota:** si tu índice usa otros campos (por ejemplo `agent.name.keyword` o severidad en otro path), ajusta los `field` según tu mapping.
+
+![Nodo HTTP Vuln summary by agent en n8n](docs/images/n8n-vuln-summary.png)
+
+### 7.3 Tool node (API Agentes) — wazuh_list_agents (JWT + Bearer vía proxy)
+
+En vez de usar dos nodos (Auth + List agents) apuntando a `:55000` con certificados "solo localhost", se usa:
+
+**Reverse proxy (Caddy)** con TLS interno exponiendo:
+```
+https://wazuh.taild88ec5.ts.net:55001
 ```
 
-> Si el nodo anterior devuelve el token como texto directo. Si el token viene dentro de JSON, ajusta a: `Bearer {{$json.data}}` o el campo exacto que estés recibiendo.
+Un **Tool node** que:
+1. hace POST auth → token raw
+2. hace GET /agents con Bearer
+3. devuelve un string TSV (requerido por AI Tool en n8n)
 
-![Flujo JWT en n8n](docs/images/n8n-jwt-flow.png)
+**Código completo del Tool (wazuh_list_agents):**
+
+```javascript
+// Tool: wazuh_list_agents
+// n8n AI Tool (Code): debe devolver STRING (TSV)
+// Proxy HTTPS (Caddy) -> Wazuh API local
+
+const BASE = "https://wazuh.taild88ec5.ts.net:55001";
+const USER = "wazuh";
+const PASS = "TU_PASSWORD";
+
+// 1) Auth (token raw como texto)
+const tokenRaw = await this.helpers.httpRequest({
+  method: "POST",
+  url: `${BASE}/security/user/authenticate?raw=true`,
+  auth: { username: USER, password: PASS },
+  json: false,
+});
+
+// Normaliza token
+const token = String(tokenRaw).replace(/^"+|"+$/g, "").trim();
+if (!token) throw new Error("Token vacío");
+
+// 2) List agents
+const agentsResp = await this.helpers.httpRequest({
+  method: "GET",
+  url: `${BASE}/agents?limit=200&select=id,name,status,lastKeepAlive,version,ip`,
+  headers: { Authorization: `Bearer ${token}` },
+  json: true,
+});
+
+const items = agentsResp?.data?.affected_items ?? [];
+
+// TSV
+const header = "name\tid\tstatus\tlastKeepAlive\tversion\tip";
+const rows = items.map((a) => [
+  a?.name ?? "N/D",
+  a?.id ?? "N/D",
+  a?.status ?? "N/D",
+  a?.lastKeepAlive ?? "N/D",
+  a?.version ?? "N/D",
+  a?.ip ?? "N/D",
+].join("\t"));
+
+// IMPORTANTE: devolver string directo
+return [header, ...rows].join("\n");
+```
+
+> 💡 **Nota:** este Tool debe estar conectado al AI Agent por `ai_tool`.
+
+![Tool node wazuh_list_agents](docs/images/n8n-tool-agents.png)
 
 ---
 
-## 🔐 8) Solución: self-signed certificate en n8n (Docker)
+## 🔐 8) Solución: certificados para API Wazuh en n8n (actualizado)
 
-### 8.1 Exportar el cert/CA desde Wazuh
+### 8.1 Diagnóstico del problema original
 
-En el host donde corre n8n:
+El certificado del API expuesto en `:55000` era autofirmado y tenía SAN solo:
+
+```
+DNS:localhost
+```
+
+Por eso fallaba al conectarse usando:
+- IP Tailscale (`100.x.x.x`)
+- o DNS de Tailscale (`wazuh.taild88ec5.ts.net`)
+
+### 8.2 Solución aplicada: Reverse Proxy con Caddy + TLS Internal
+
+Se instaló **Caddy** en el servidor Wazuh (Ubuntu) y se expuso el API en:
+
+```
+https://wazuh.taild88ec5.ts.net:55001
+```
+
+✅ certificado válido para ese DNS (emitido por Caddy CA)
+
+y se hizo proxy hacia:
+
+```
+https://127.0.0.1:55000 (API real)
+```
+
+#### 8.2.1 Instalar Caddy (Ubuntu)
 
 ```bash
-mkdir -p ~/n8n/certs
+sudo apt update
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
 
-echo | openssl s_client -connect 100.109.242.43:55000 -servername 100.109.242.43 -showcerts 2>/dev/null \
-| awk '/BEGIN CERTIFICATE/{flag=1} flag{print} /END CERTIFICATE/{exit}' \
-> ~/n8n/certs/wazuh-ca.crt
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+| sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 
-openssl x509 -in ~/n8n/certs/wazuh-ca.crt -noout -subject -issuer -dates
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+| sudo tee /etc/apt/sources.list.d/caddy-stable.list
+
+sudo apt update
+sudo apt install -y caddy
 ```
 
-![Exportar certificado](docs/images/exportar-cert.png)
+![Instalación de Caddy](docs/images/caddy-install.png)
 
-### 8.2 Montar el cert en el stack n8n-ngrok
+#### 8.2.2 Configurar Caddyfile
 
-**Copiar el cert al folder del compose:**
+Editar:
 
 ```bash
-mkdir -p ~/n8n-ngrok/certs
-cp ~/n8n/certs/wazuh-ca.crt ~/n8n-ngrok/certs/wazuh-ca.crt
+sudo nano /etc/caddy/Caddyfile
 ```
 
-**Editar `~/n8n-ngrok/docker-compose.yml`** y en el servicio `n8n` agregar:
+**Contenido:**
 
-**En `volumes`:**
+```caddy
+wazuh.taild88ec5.ts.net:55001 {
+
+  tls internal
+
+  reverse_proxy https://127.0.0.1:55000 {
+    transport http {
+      tls
+      tls_insecure_skip_verify
+    }
+  }
+}
+```
+
+Validar y recargar:
+
+```bash
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+```
+
+![Caddyfile configurado](docs/images/caddyfile.png)
+
+#### 8.2.3 Probar el proxy (esperado 401)
+
+```bash
+curl -vk https://wazuh.taild88ec5.ts.net:55001/ | head
+```
+
+Debe responder **401 Unauthorized** porque no hay token.
+
+### 8.3 Confiar en el certificado de Caddy desde n8n
+
+Como Caddy usa una CA interna, se exporta el CA root y se monta en el contenedor n8n.
+
+#### 8.3.1 Exportar CA root (en server Wazuh)
+
+```bash
+sudo cp /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt /tmp/caddy-root.crt
+sudo chmod 644 /tmp/caddy-root.crt
+```
+
+Copiar al host n8n (ejemplo):
+
+```bash
+scp /tmp/caddy-root.crt gar16@<HOST_N8N>:~/n8n-ngrok/certs/caddy-root.crt
+```
+
+![Exportar certificado Caddy](docs/images/caddy-cert-export.png)
+
+#### 8.3.2 Montar CA en docker-compose de n8n
+
+En `~/n8n-ngrok/docker-compose.yml`, en el servicio `n8n`:
+
+**volumes:**
 
 ```yaml
-      - ./certs/wazuh-ca.crt:/certs/wazuh-ca.crt:ro
+- ./certs/caddy-root.crt:/certs/caddy-root.crt:ro
 ```
 
-**En `environment`:**
+**environment:**
 
 ```yaml
-      - NODE_EXTRA_CA_CERTS=/certs/wazuh-ca.crt
+- NODE_EXTRA_CA_CERTS=/certs/caddy-root.crt
 ```
 
-**Reiniciar:**
+Reiniciar:
 
 ```bash
 cd ~/n8n-ngrok
-sudo docker compose down
-sudo docker compose up -d
-sudo docker compose logs -f n8n
+docker compose up -d
 ```
 
-![Certificado montado en n8n](docs/images/n8n-cert-mounted.png)
+#### 8.3.3 Prueba dentro del contenedor n8n (sin curl)
+
+```bash
+docker compose exec n8n sh -lc 'node -e "require(\"https\").get(\"https://wazuh.taild88ec5.ts.net:55001/\",res=>{console.log(\"status\",res.statusCode);res.resume();}).on(\"error\",e=>{console.error(e.message);});"'
+```
+
+Debe devolver `status 401`.
+
+![Certificado montado en n8n](docs/images/n8n-caddy-cert.png)
 
 ---
 
-## 💬 9) Preguntas de prueba para tu AI Agent
+## 💬 9) Preguntas de prueba para tu AI Agent (actualizado)
 
 ### Alertas (9200)
 
@@ -438,10 +610,11 @@ sudo docker compose logs -f n8n
 - "Resume las alertas de las últimas 24h por severidad."
 - "¿Qué agente generó más alertas en las últimas 24h?"
 
-### Agentes (55000)
+### Agentes (Tool wazuh_list_agents)
 
 - "Lista mis agentes y dime cuáles están active y cuáles disconnected."
 - "Dime la versión y última conexión de cada agente."
+- "¿Cuál es la IP y el estado del agente proxmox?"
 
 ### Vulnerabilidades (9200)
 
@@ -450,7 +623,7 @@ sudo docker compose logs -f n8n
 
 ---
 
-## 🔧 10) Troubleshooting rápido
+## 🔧 10) Troubleshooting rápido (actualizado)
 
 ### 10.1 401 Unauthorized (Indexer)
 
@@ -462,30 +635,28 @@ Verifica usuario/clave `admin` del tar `wazuh-install-files.tar`
 curl -sk -u "admin:PASS" https://100.109.242.43:9200/_opendistro/_security/authinfo?pretty
 ```
 
-### 10.2 Indexer solo responde en localhost
+### 10.2 Proxy Caddy (55001) responde 401
 
-**Confirma:**
+✅ Correcto si llamas `/` sin token.
 
-```bash
-sudo ss -tlnp | grep 9200
-```
+Para endpoints protegidos usa Bearer token.
 
-Debe escuchar en `0.0.0.0:9200` o `:::9200` si quieres acceso remoto.
+### 10.3 Error de certificado en n8n contra 55001
 
-### 10.3 n8n self-signed certificate
-
-**Solución segura:** `NODE_EXTRA_CA_CERTS` + volumen con CA/cert.
+- Revisa montaje de `caddy-root.crt`
+- Revisa `NODE_EXTRA_CA_CERTS=/certs/caddy-root.crt`
+- Reinicia contenedor n8n
 
 ---
 
-## 📍 11) Endpoints clave
+## 📍 11) Endpoints clave (actualizado)
 
-### API Wazuh (55000)
+### API Wazuh (vía Caddy proxy)
 
 | Endpoint | Método | Descripción |
 |----------|--------|-------------|
-| `/security/user/authenticate?raw=true` | POST | Obtener JWT token |
-| `/agents?limit=...&select=...` | GET | Listar agentes |
+| `https://wazuh.taild88ec5.ts.net:55001/security/user/authenticate?raw=true` | POST | Obtener JWT token (texto raw) |
+| `https://wazuh.taild88ec5.ts.net:55001/agents?limit=...&select=...` | GET | Listar agentes |
 
 ### Indexer (9200)
 

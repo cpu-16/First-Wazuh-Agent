@@ -33,7 +33,7 @@
 
 ## 🎥 Demo en video
 
-![Demo Wazuh + n8n Integration](docs/images/demo.gif)
+![Demo Wazuh + n8n Integration](docs/images/video.gif)
 
 Este README documenta el laboratorio completo:
 

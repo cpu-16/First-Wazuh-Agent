@@ -38,10 +38,15 @@ Este README documenta el laboratorio completo:
 - Conexión de agentes (hosts) hacia el Manager
 - Consultas al Indexer (OpenSearch) por puerto **9200**
 - Uso de la API de Wazuh por puerto **55000** (JWT)
-- Flujo en **n8n** para:
-  - consultar alertas
-  - consultar vulnerabilidades
+- Flujo en **n8n** (`First_Wazuh_Agent`) para:
+  - consultar alertas recientes
   - listar agentes activos/desconectados
+  - resumir vulnerabilidades por agente
+  - identificar IPs origen mas ruidosas
+  - identificar reglas mas disparadas
+  - investigar una IP concreta en alertas
+  - priorizar agentes por riesgo reciente
+  - ejecutar bloqueo controlado por Active Response
 - Solución del error **self-signed certificate** en n8n montando el CA/cert
 
 ---
@@ -257,17 +262,111 @@ curl -sk -u "admin:TU_PASSWORD_ADMIN" \
 
 ## Integración con n8n (actualizado)
 
-**Recomendación práctica:**
+### Workflow real implementado
+
+El workflow actualmente trabajado y validado es:
+
+```text
+First_Wazuh_Agent
+```
+
+Este agente ya no es solo un viewer de alertas. Quedo preparado para dos modos:
+
+- **SOC analista**: consulta, resumen, triage y priorizacion
+- **SOC respuesta**: recomendacion y bloqueo controlado via Active Response
+
+### Capacidades actuales del workflow
+
+Tools conectadas al AI Agent:
+
+| Tool | Tipo | Uso real |
+|------|------|----------|
+| `Get last alerts from indexer` | HTTP Tool | Ultimas alertas en `wazuh-alerts-4.x-*` |
+| `wazuh_list_agents` | Code Tool | Lista agentes con `id`, `name`, `status`, `lastKeepAlive`, `version`, `ip` |
+| `Vuln summary by agent` | HTTP Tool | Resumen de vulnerabilidades por agente y severidad |
+| `Top source IPs in alerts` | HTTP Tool | Top IPs origen con mas alertas y severidad configurable |
+| `Top triggered rules` | HTTP Tool | Reglas mas disparadas en una ventana de tiempo |
+| `Investigate IP in alerts` | HTTP Tool | Evidencia de una IP concreta en alertas recientes |
+| `Agent risk summary` | HTTP Tool | Priorizacion de agentes por severidad maxima y conteo critico |
+| `Block IP via Wazuh active response` | Code Tool | Bloqueo real solo bajo confirmacion explicita |
+
+### Comportamiento operativo del agente
+
+- El agente responde en espanol.
+- Para estado de agentes usa siempre `wazuh_list_agents`.
+- Para alertas, IPs, reglas y riesgo usa siempre el Indexer (`9200`).
+- Antes de recomendar un bloqueo, investiga y muestra evidencia.
+- El bloqueo real no se ejecuta automaticamente: requiere confirmacion explicita del usuario.
+
+**Arquitectura práctica del workflow:**
 
 - **2 nodos HTTP para Indexer (9200)**
-  - 1 para alertas/búsquedas y agregaciones
-  - 1 para vulnerabilidades (Vuln summary by agent)
-- **1 Tool node (Code)** para la API de agentes (JWT + Bearer), a través del proxy con certificado válido
+  - 1 o varios para alertas/busquedas y agregaciones
+  - 1 para vulnerabilidades (`Vuln summary by agent`)
+- **1 Tool node (Code)** para la API de agentes (JWT + Bearer), a traves del proxy con certificado valido
+- **1 Tool node (Code)** para Active Response via API de Wazuh
 
 **No conviene mezclar todo en un solo nodo porque:**
 - cambian endpoints (9200 vs 55001)
 - cambia el tipo de auth (Basic vs JWT/Bearer)
-- cambia la semántica (alertas/vulns vs agentes)
+- cambia la semantica (alertas/vulns vs agentes/acciones)
+
+### Consultas analiticas agregadas al workflow
+
+#### Top source IPs in alerts
+
+Esta tool permite identificar IPs origen que generan mas alertas en una ventana de tiempo. La consulta usa una agregacion con script para cubrir entornos donde la IP puede venir en `data.srcip` o en `srcip`.
+
+Casos de uso:
+
+- detectar brute force o accesos fallidos repetidos
+- identificar IPs mas ruidosas del dia
+- seleccionar candidatos para investigacion o bloqueo
+
+#### Top triggered rules
+
+Resume las reglas mas disparadas para responder preguntas como:
+
+- que tipo de eventos domina el entorno
+- que reglas generan mas ruido
+- que patron de ataque se esta viendo con mayor frecuencia
+
+#### Investigate IP in alerts
+
+Busca una IP exacta en alertas recientes y devuelve evidencia util para analisis:
+
+- timestamp
+- agente afectado
+- regla disparada
+- severidad
+- decoder
+
+#### Agent risk summary
+
+Resume los agentes con mayor severidad maxima y conteo critico reciente. Sirve para priorizar endpoints y revisar que hosts requieren atencion primero.
+
+### Respuesta controlada: Active Response
+
+Se agrego una tool de respuesta real:
+
+```text
+Block IP via Wazuh active response
+```
+
+Esta tool:
+
+- autentica contra la API de Wazuh via proxy `55001`
+- envia `PUT /active-response`
+- rechaza IPs privadas, loopback, link-local o rangos internos
+- solo se debe usar tras confirmacion explicita del usuario
+
+Formato esperado por la tool:
+
+```text
+CONFIRMAR BLOQUEO ip=203.0.113.45 agentes=001,002 razon=SSH brute force comando=firewall-drop
+```
+
+> Recomendacion: en produccion, anadir whitelist, registro/auditoria y aprobacion humana antes de bloquear.
 
 ### Nodo HTTP (Indexer 9200) — Body ejemplo (últimas 2h)
 
@@ -559,6 +658,21 @@ Debe devolver `status 401`.
 - "Dame el resumen de vulnerabilidades por agente (Critical/High/Medium/Low)."
 - "¿Qué agente tiene más vulnerabilidades High?"
 
+### IPs y técnicas de ataque
+
+- "¿Cuáles son las 10 IPs origen con más alertas en las últimas 24 horas?"
+- "¿Qué reglas se dispararon más en las últimas 24 horas?"
+- "Investiga la IP ::ffff:100.103.107.115 en las últimas 48 horas."
+- "¿Qué agentes tienen más riesgo en las últimas 24 horas?"
+
+### Respuesta controlada
+
+- "Investiga la IP 203.0.113.45 y dime si recomiendas bloquearla."
+- "Sí, confirma el bloqueo de la IP 203.0.113.45 en el agente 001."
+- "Bloquea la IP 203.0.113.45 en los agentes 001,002."
+
+> Si el agente esta funcionando correctamente, primero deberia mostrar evidencia y pedir confirmacion antes de usar Active Response.
+
 ---
 
 ## Troubleshooting rápido (actualizado)
@@ -585,6 +699,17 @@ Para endpoints protegidos usa Bearer token.
 - Revisa `NODE_EXTRA_CA_CERTS=/certs/caddy-root.crt`
 - Reinicia contenedor n8n
 
+### Error `Unbalanced parentheses while parsing $fromAI call`
+
+Si una tool HTTP falla al inicializarse dentro del AI Agent, revisa que el body no tenga comillas escapadas tipo `\'` dentro de expresiones `$fromAI(...)`.
+
+Esto afecto en este laboratorio a tools como:
+
+- `Agent risk summary`
+- `Top source IPs in alerts`
+
+Solucion: reescribir el body del nodo con comillas simples normales dentro de `$fromAI(...)` y volver a guardar el workflow.
+
 ---
 
 ## Endpoints clave (actualizado)
@@ -595,6 +720,7 @@ Para endpoints protegidos usa Bearer token.
 |----------|--------|-------------|
 | `https://wazuh.taild88ec5.ts.net:55001/security/user/authenticate?raw=true` | POST | Obtener JWT token (texto raw) |
 | `https://wazuh.taild88ec5.ts.net:55001/agents?limit=...&select=...` | GET | Listar agentes |
+| `https://wazuh.taild88ec5.ts.net:55001/active-response?agents_list=...` | PUT | Enviar Active Response a uno o varios agentes |
 
 ### Indexer (9200)
 
